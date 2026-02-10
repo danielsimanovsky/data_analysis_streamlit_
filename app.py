@@ -90,12 +90,14 @@ def load_and_process_data_from_dir(directory):
         agg_rules['elapsed [sec]'] = 'mean'
         agg_rules['is_experiment'] = lambda x: x.mode()[0] if not x.mode().empty else False
 
-        df_agg = df.groupby('time_bin').agg(agg_rules)
+        # *** FIX HERE: Add .reset_index() to keep time_bin as a column ***
+        df_agg = df.groupby('time_bin').agg(agg_rules).reset_index()
 
         # Flatten columns
         df_agg.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in df_agg.columns]
 
         rename_map = {
+            'time_bin_': 'time_bin',  # Handle potential suffix from flattening
             'applied pressure [mmHg]_max': 'pressure_max',
             'applied pressure [mmHg]_mean': 'pressure_mean',
             'elapsed [sec]_mean': 'local_time',
@@ -107,7 +109,6 @@ def load_and_process_data_from_dir(directory):
         df_agg['global_time'] = df_agg['local_time'] + cumulative_time_offset
         df_agg['condition'] = condition_str
         df_agg['original_file'] = os.path.basename(file_path)
-        # IMPORTANT: Store full path for retrieval later
         df_agg['source_path'] = file_path 
 
         all_aggregated_data.append(df_agg)
@@ -131,9 +132,11 @@ def get_raw_data_slice(file_path, time_bin):
     try:
         df = pd.read_csv(file_path, skiprows=4)
         df['bin'] = (df['elapsed [sec]'] // 30).astype(int)
+        # Filter for the specific bin
         subset = df[df['bin'] == time_bin].copy()
         return subset
     except Exception as e:
+        st.error(f"Error reading file {file_path}: {e}")
         return pd.DataFrame()
 
 # --- Main App ---
@@ -273,8 +276,14 @@ with tempfile.TemporaryDirectory() as temp_dir:
             
             # Retrieve metadata for that point
             selected_row = df.iloc[point_index]
+            
+            # Ensure time_bin exists before accessing
+            if 'time_bin' not in selected_row:
+                 st.error("Error: 'time_bin' data missing. Please check file format.")
+                 st.stop()
+                 
+            target_bin = int(selected_row['time_bin'])
             target_file = selected_row['source_path']
-            target_bin = selected_row['time_bin']
             target_condition = selected_row['condition']
             
             st.subheader(f"🔍 Detail View: {target_condition} (Bin #{target_bin})")
@@ -284,11 +293,10 @@ with tempfile.TemporaryDirectory() as temp_dir:
             raw_slice = get_raw_data_slice(target_file, target_bin)
             
             if not raw_slice.empty:
-                # Create Detail Graph
                 fig_detail = make_subplots(specs=[[{"secondary_y": True}]])
                 
                 # Raw Sensor Data
-                raw_sensor_col = selected_sensor_col.replace("_mean", "") # Back to original name
+                raw_sensor_col = selected_sensor_col.replace("_mean", "") 
                 if raw_sensor_col in raw_slice.columns:
                      fig_detail.add_trace(go.Scatter(
                         x=raw_slice['elapsed [sec]'], y=raw_slice[raw_sensor_col],
