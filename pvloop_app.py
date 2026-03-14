@@ -11,7 +11,6 @@ st.set_page_config(page_title="PV Loop Hemodynamics Dashboard", layout="wide")
 st.title("Hemodynamic PV Loop Analysis Dashboard")
 st.markdown("""
 *Use this exploratory tool to visualize intra-individual responses (Before vs. After) and pooled inter-individual changes ($\Delta$).*
-**Methodological Note for Publication:** Visualizing all variables is appropriate for exploration. Formal hypothesis testing should be restricted to a priori primary endpoints to prevent Type I error inflation.
 """)
 
 
