@@ -7,6 +7,7 @@ import os
 import zipfile
 import tempfile
 import io
+import re
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="Experiment Dashboard", page_icon="🧪")
@@ -209,6 +210,17 @@ st.markdown("""
     ::-webkit-scrollbar-track { background: #0d1117; }
     ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
+
+    /* Tabs */
+    [data-testid="stTabs"] button {
+        font-family: 'IBM Plex Sans', sans-serif !important;
+        font-weight: 500 !important;
+        color: #8b949e !important;
+    }
+    [data-testid="stTabs"] button[aria-selected="true"] {
+        color: #e6edf3 !important;
+        border-bottom-color: #1f6feb !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -221,8 +233,38 @@ SENSOR_COLORS = {
     'mRA (G)': '#8c564b'  # Chestnut Brown
 }
 
+MULTI_PALETTE = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+    '#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F'
+]
+
 
 # --- Helper Functions ---
+
+def clean_condition_name(raw_name):
+    """
+    Cleans messy strings like 'expirium -40 = expirium- 40 = ,,,,,expirium-40 = ,expirium-40 second time ,,,,,,,'
+    Extracts strictly to 'Expirium 40' or 'Inspirium 20'.
+    """
+    name = str(raw_name).lower()
+    phase = ""
+
+    if 'insp' in name:
+        phase = "Inspirium"
+    elif 'exp' in name or 'exs' in name:
+        phase = "Expirium"
+    else:
+        return str(raw_name).strip()  # Return as is if no clear phase detected
+
+    # Search for the first number sequence
+    num_match = re.search(r'(\d+)', name)
+    if num_match:
+        pressure = num_match.group(1)
+        return f"{phase} {pressure}"
+
+    return phase
+
 
 def load_and_process_data_from_dir(directory, agg_mode="30s", subject_id="Unknown"):
     """
@@ -289,11 +331,15 @@ def load_and_process_data_from_dir(directory, agg_mode="30s", subject_id="Unknow
         if 'elapsed [sec]' not in df.columns:
             continue
 
+        resp_col_candidates = [c for c in df.columns if 'resp' in c.lower() and 'rate' in c.lower()]
+        has_resp_rate = len(resp_col_candidates) > 0
+        if has_resp_rate:
+            resp_col = resp_col_candidates[0]
+            df['standard_resp_rate'] = pd.to_numeric(df[resp_col], errors='coerce')
+
         if agg_mode == "resp_rate":
-            resp_col_candidates = [c for c in df.columns if 'resp' in c.lower() and 'rate' in c.lower()]
-            if resp_col_candidates:
-                resp_col = resp_col_candidates[0]
-                valid_rate = pd.to_numeric(df[resp_col], errors='coerce').replace(0, pd.NA)
+            if has_resp_rate:
+                valid_rate = df['standard_resp_rate'].replace(0, pd.NA)
                 cycle_sec = 60.0 / valid_rate
                 df['time_bin'] = (df['elapsed [sec]'] // cycle_sec).fillna(df['elapsed [sec]'] // 30).astype(int)
             else:
@@ -309,6 +355,9 @@ def load_and_process_data_from_dir(directory, agg_mode="30s", subject_id="Unknow
         if 'applied pressure [mmHg]' in df.columns:
             agg_rules['applied pressure [mmHg]'] = ['max', 'mean']
 
+        if has_resp_rate:
+            agg_rules['standard_resp_rate'] = 'mean'
+
         agg_rules['elapsed [sec]'] = 'mean'
         agg_rules['is_experiment'] = lambda x: x.mode()[0] if not x.mode().empty else False
 
@@ -321,7 +370,8 @@ def load_and_process_data_from_dir(directory, agg_mode="30s", subject_id="Unknow
             'applied pressure [mmHg]_max': 'pressure_max',
             'applied pressure [mmHg]_mean': 'pressure_mean',
             'elapsed [sec]_mean': 'local_time',
-            'is_experiment_<lambda>': 'is_experiment'
+            'is_experiment_<lambda>': 'is_experiment',
+            'standard_resp_rate_mean': 'resp_rate'
         }
         df_agg = df_agg.rename(columns=rename_map)
 
@@ -374,73 +424,97 @@ def get_raw_data_slice(file_path, time_bin, agg_mode="30s"):
 
 def extract_pre_post_stats(files_df, sensors_to_calc, available_map):
     """
-    Extracts exact 30-sec pre/post statistics based on a DataFrame of target files.
+    Extracts exact 30-sec pre/post statistics.
+    Pre = Last 30s of REST in the PREVIOUS file.
+    Post = First 30s of ACTIVE in the CURRENT file.
     """
     results = []
-    for _, row in files_df.iterrows():
-        fpath = row['source_path']
-        subj = row['subject_id']
-        cond = row['condition']
+    subjects = files_df['subject_id'].unique()
 
-        try:
-            raw_df = pd.read_csv(fpath, skiprows=4)
-            if 'elapsed [sec]' not in raw_df.columns or 'motor_pwm' not in raw_df.columns:
+    for subj in subjects:
+        subj_files = files_df[files_df['subject_id'] == subj]
+        paths = subj_files['source_path'].tolist()
+        conds = subj_files['condition'].tolist()
+
+        for i in range(1, len(paths)):
+            prev_path = paths[i - 1]
+            curr_path = paths[i]
+            curr_cond = conds[i]
+            prev_cond = conds[i - 1]
+
+            try:
+                # --- 1. POST (Current File Active Part) ---
+                curr_df = pd.read_csv(curr_path, skiprows=4)
+                if 'elapsed [sec]' not in curr_df.columns or 'motor_pwm' not in curr_df.columns:
+                    continue
+
+                exp_starts = curr_df[curr_df['motor_pwm'] > 0]
+                if exp_starts.empty:
+                    continue
+
+                t_start_active = exp_starts['elapsed [sec]'].iloc[0]
+                post_df = curr_df[(curr_df['elapsed [sec]'] >= t_start_active) &
+                                  (curr_df['elapsed [sec]'] <= t_start_active + 30)]
+
+                # --- 2. PRE (Previous File Rest Part) ---
+                prev_df = pd.read_csv(prev_path, skiprows=4)
+                if 'elapsed [sec]' not in prev_df.columns or 'motor_pwm' not in prev_df.columns:
+                    pre_df = pd.DataFrame()
+                else:
+                    rest_part = prev_df[prev_df['motor_pwm'] == 0]
+                    if rest_part.empty:
+                        rest_part = prev_df  # Fallback
+                    t_end_rest = rest_part['elapsed [sec]'].max()
+                    pre_df = rest_part[(rest_part['elapsed [sec]'] >= t_end_rest - 30) &
+                                       (rest_part['elapsed [sec]'] <= t_end_rest)]
+
+                row_data = {
+                    'Subject ID': subj,
+                    'Condition Raw': curr_cond,
+                    'Baseline Source Raw': prev_cond,
+                    'File': os.path.basename(curr_path)
+                }
+
+                for label in sensors_to_calc:
+                    raw_col = available_map[label].replace("_mean", "")
+                    if raw_col in curr_df.columns:
+                        # Baseline (Pre)
+                        if not pre_df.empty and raw_col in pre_df.columns:
+                            row_data[f'{label} Pre Mean'] = round(pre_df[raw_col].mean(), 2)
+                            row_data[f'{label} Pre SD'] = round(pre_df[raw_col].std(), 2)
+                            row_data[f'{label} Pre Min'] = round(pre_df[raw_col].min(), 2)
+                            row_data[f'{label} Pre Max'] = round(pre_df[raw_col].max(), 2)
+                        else:
+                            row_data[f'{label} Pre Mean'] = pd.NA
+                            row_data[f'{label} Pre SD'] = pd.NA
+                            row_data[f'{label} Pre Min'] = pd.NA
+                            row_data[f'{label} Pre Max'] = pd.NA
+
+                        # Experiment (Post)
+                        if not post_df.empty:
+                            row_data[f'{label} Post Mean'] = round(post_df[raw_col].mean(), 2)
+                            row_data[f'{label} Post SD'] = round(post_df[raw_col].std(), 2)
+                            row_data[f'{label} Post Min'] = round(post_df[raw_col].min(), 2)
+                            row_data[f'{label} Post Max'] = round(post_df[raw_col].max(), 2)
+                        else:
+                            row_data[f'{label} Post Mean'] = pd.NA
+                            row_data[f'{label} Post SD'] = pd.NA
+                            row_data[f'{label} Post Min'] = pd.NA
+                            row_data[f'{label} Post Max'] = pd.NA
+
+                        # Delta & Error Propagation
+                        if not pre_df.empty and not post_df.empty and raw_col in pre_df.columns:
+                            row_data[f'{label} Δ (Post - Pre)'] = round(
+                                post_df[raw_col].mean() - pre_df[raw_col].mean(), 2)
+                            row_data[f'{label} Δ SD'] = round(
+                                (pre_df[raw_col].std() ** 2 + post_df[raw_col].std() ** 2) ** 0.5, 2)
+                        else:
+                            row_data[f'{label} Δ (Post - Pre)'] = pd.NA
+                            row_data[f'{label} Δ SD'] = pd.NA
+
+                results.append(row_data)
+            except Exception:
                 continue
-
-            # Exact millisecond the experiment begins
-            exp_starts = raw_df[raw_df['motor_pwm'] > 0]
-            if exp_starts.empty:
-                continue
-
-            t_start = exp_starts['elapsed [sec]'].iloc[0]
-
-            # 30 seconds strictly before, and 30 seconds strictly after trigger
-            pre_df = raw_df[(raw_df['elapsed [sec]'] >= t_start - 30) & (raw_df['elapsed [sec]'] < t_start)]
-            post_df = raw_df[(raw_df['elapsed [sec]'] >= t_start) & (raw_df['elapsed [sec]'] <= t_start + 30)]
-
-            row_data = {
-                'Subject ID': subj,
-                'Condition': cond,
-                'File': os.path.basename(fpath),
-                'Start Trigger [sec]': round(t_start, 1)
-            }
-
-            for label in sensors_to_calc:
-                raw_col = available_map[label].replace("_mean", "")
-                if raw_col in raw_df.columns:
-                    # Baseline (Pre)
-                    if not pre_df.empty:
-                        row_data[f'{label} Pre Mean'] = round(pre_df[raw_col].mean(), 2)
-                        row_data[f'{label} Pre SD'] = round(pre_df[raw_col].std(), 2)
-                        row_data[f'{label} Pre Min'] = round(pre_df[raw_col].min(), 2)
-                        row_data[f'{label} Pre Max'] = round(pre_df[raw_col].max(), 2)
-                    else:
-                        row_data[f'{label} Pre Mean'] = pd.NA
-                        row_data[f'{label} Pre SD'] = pd.NA
-                        row_data[f'{label} Pre Min'] = pd.NA
-                        row_data[f'{label} Pre Max'] = pd.NA
-
-                    # Experiment (Post)
-                    if not post_df.empty:
-                        row_data[f'{label} Post Mean'] = round(post_df[raw_col].mean(), 2)
-                        row_data[f'{label} Post SD'] = round(post_df[raw_col].std(), 2)
-                        row_data[f'{label} Post Min'] = round(post_df[raw_col].min(), 2)
-                        row_data[f'{label} Post Max'] = round(post_df[raw_col].max(), 2)
-                    else:
-                        row_data[f'{label} Post Mean'] = pd.NA
-                        row_data[f'{label} Post SD'] = pd.NA
-                        row_data[f'{label} Post Min'] = pd.NA
-                        row_data[f'{label} Post Max'] = pd.NA
-
-                    # Delta
-                    if not pre_df.empty and not post_df.empty:
-                        row_data[f'{label} Δ (Post - Pre)'] = round(post_df[raw_col].mean() - pre_df[raw_col].mean(), 2)
-                    else:
-                        row_data[f'{label} Δ (Post - Pre)'] = pd.NA
-
-            results.append(row_data)
-        except Exception:
-            continue
 
     return pd.DataFrame(results)
 
@@ -535,7 +609,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         if phase_filter == "Inspirium Only":
             df_all = df_all_raw[df_all_raw['condition'].str.lower().str.contains('insp', na=False)].copy()
         elif phase_filter == "Expirium Only":
-            df_all = df_all_raw[df_all_raw['condition'].str.lower().str.contains('exp', na=False)].copy()
+            df_all = df_all_raw[df_all_raw['condition'].str.lower().str.contains('exp|exs', na=False)].copy()
         else:
             df_all = df_all_raw.copy()
 
@@ -624,11 +698,6 @@ with tempfile.TemporaryDirectory() as temp_dir:
         dash_styles = ['solid', 'dash', 'dot', 'dashdot', 'longdash']
 
         # Dynamic Color Allocation Logic
-        MULTI_PALETTE = [
-            '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-            '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-            '#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F'
-        ]
         is_multi_subj = len(selected_subjects) > 1
         num_sensors = len(selected_sensor_labels)
 
@@ -702,6 +771,12 @@ with tempfile.TemporaryDirectory() as temp_dir:
                                          marker=dict(size=4, symbol='diamond'),
                                          name=f'{subj} - Max Pressure'), secondary_y=True)
 
+            if 'resp_rate' in df_subj.columns and df_subj['resp_rate'].notna().any():
+                fig.add_trace(go.Scatter(x=df_subj['global_time'], y=df_subj['resp_rate'], mode=trace_mode,
+                                         line=dict(color='#8b949e', width=2, dash=dash_style),
+                                         marker=dict(size=4, symbol='triangle-up'),
+                                         name=f'{subj} - Resp Rate (bpm)'), secondary_y=True)
+
         title_prefix = "30s" if agg_mode == "30s" else "Respiratory Cycle"
         subj_title = "Multiple Subjects" if len(selected_subjects) > 1 else selected_subjects[0]
 
@@ -742,7 +817,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
             )
         )
         fig.update_yaxes(title_text="Sensor Value (mmHg)", secondary_y=False, title_font=dict(color="#8b949e", size=11))
-        fig.update_yaxes(title_text="Pressure (mmHg)", secondary_y=True, title_font=dict(color="#8b949e", size=11))
+        fig.update_yaxes(title_text="Pressure / Resp Rate", secondary_y=True, title_font=dict(color="#8b949e", size=11))
 
         if len(selected_subjects) > 1:
             st.info(
@@ -811,6 +886,18 @@ with tempfile.TemporaryDirectory() as temp_dir:
                                 name='Raw Applied Pressure'
                             ), secondary_y=True)
 
+                        resp_col_candidates = [c for c in raw_slice.columns if
+                                               'resp' in c.lower() and 'rate' in c.lower()]
+                        if resp_col_candidates:
+                            resp_col_name = resp_col_candidates[0]
+                            fig_detail.add_trace(go.Scatter(
+                                x=raw_slice['elapsed [sec]'],
+                                y=pd.to_numeric(raw_slice[resp_col_name], errors='coerce'),
+                                mode=raw_trace_mode, line=dict(color='#8b949e', width=2, dash='dot'),
+                                marker=dict(size=4, color='#8b949e', symbol='triangle-up'),
+                                name='Raw Resp Rate'
+                            ), secondary_y=True)
+
                         fig_detail.update_layout(
                             height=400, hovermode="x unified", showlegend=True,
                             paper_bgcolor="#161b22",
@@ -840,7 +927,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
                                                 title_font=dict(color="#8b949e", size=11))
                         fig_detail.update_yaxes(title_text="Sensor Raw (mmHg)", secondary_y=False,
                                                 title_font=dict(color="#8b949e", size=11))
-                        fig_detail.update_yaxes(title_text="Pressure Raw", secondary_y=True,
+                        fig_detail.update_yaxes(title_text="Pressure / Resp Rate", secondary_y=True,
                                                 title_font=dict(color="#d62728", size=11))
 
                         st.plotly_chart(fig_detail, use_container_width=True)
@@ -864,21 +951,207 @@ with tempfile.TemporaryDirectory() as temp_dir:
     st.markdown("""
 <div style="margin:1.5rem 0 0.5rem 0; padding:0.75rem 1rem; background:#161b22; border:1px solid #21262d; border-left:3px solid #2ca02c; border-radius:6px;">
     <div style="font-family:'IBM Plex Sans',sans-serif; font-size:1rem; font-weight:500; color:#e6edf3;">📊 Master Pre/Post Statistical Summary (All Subjects)</div>
-    <div style="font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8b949e; margin-top:4px;">EXACT 30S BASELINE VS 30S EXPERIMENT</div>
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8b949e; margin-top:4px;">ADJACENT EXPERIMENT COMPARISON</div>
 </div>
 """, unsafe_allow_html=True)
     st.caption(
-        "Calculates stats for **ALL loaded subjects** across your currently active phase filter. Automatically detects the exact millisecond the intervention triggers and strictly extracts the 30 seconds before and 30 seconds after.")
+        "Calculates stats by comparing the **last 30s of REST in the PREVIOUS file** against the **first 30s of ACTIVE intervention in the CURRENT file**. This correctly pairs your active phases with their true preceding baseline. Results are filtered by your current respiratory phase selection.")
 
-    # We pull files from df_all (which respects Phase Filter, but includes ALL pigs and ALL batches)
-    stats_input_df = df_all[['source_path', 'subject_id', 'condition']].drop_duplicates()
+    # We pull files from df_all_raw (which contains ALL files, unfiltered, to preserve chronological order for baselines)
+    stats_input_df = df_all_raw[['source_path', 'subject_id', 'condition']].drop_duplicates()
 
     if not stats_input_df.empty:
         with st.spinner("Calculating rigorous Pre/Post statistics across all subjects..."):
             stats_df = extract_pre_post_stats(stats_input_df, selected_sensor_labels, available_map)
 
         if not stats_df.empty:
+
+            # Apply regex text cleaning to standardise 'Expirium 40', 'Inspirium 80', etc.
+            stats_df['Clean Condition'] = stats_df['Condition Raw'].apply(clean_condition_name)
+
+            # To handle multiple runs of the same condition for the same pig
+            stats_df['Run ID'] = stats_df.groupby(['Subject ID', 'Clean Condition']).cumcount() + 1
+            stats_df['Intervention Label'] = stats_df['Clean Condition'] + " (Run " + stats_df['Run ID'].astype(
+                str) + ")"
+
+            # Apply UI phase filter to the output so we only see the relevant rows
+            if phase_filter == "Inspirium Only":
+                stats_df = stats_df[stats_df['Clean Condition'].str.contains('Inspirium', na=False)]
+            elif phase_filter == "Expirium Only":
+                stats_df = stats_df[stats_df['Clean Condition'].str.contains('Expirium', na=False)]
+
             st.dataframe(stats_df, use_container_width=True)
+
+            # --- New: Statistical Visualizations (Bar Graphs) ---
+            st.markdown("""
+            <div style="margin:2.5rem 0 1rem 0; padding:0.75rem 1rem; background:#161b22; border:1px solid #21262d; border-left:3px solid #9467bd; border-radius:6px;">
+                <div style="font-family:'IBM Plex Sans',sans-serif; font-size:1rem; font-weight:500; color:#e6edf3;">📈 Statistical Visualizations (Bar Graphs)</div>
+                <div style="font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8b949e; margin-top:4px;">MULTI-RUN PAIRED COMPARISONS & COHORT VARIABILITY</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            stat_sensor = st.selectbox("Select Sensor to Visualize:", selected_sensor_labels, key="stat_sensor_select")
+
+            tab1, tab2, tab3 = st.tabs([
+                "📊 1. Overall Delta (Per Pig)",
+                "📊 2. Before vs After (Per Pig)",
+                "📊 3. Intervention Comparison (Across Cohort)"
+            ])
+
+            # TAB 1: Delta per Pig
+            with tab1:
+                sel_pig_1 = st.selectbox("Select Subject:", available_subjects, key="t1_pig")
+                pig_df_1 = stats_df[stats_df['Subject ID'] == sel_pig_1].dropna(
+                    subset=[f'{stat_sensor} Δ (Post - Pre)'])
+
+                if not pig_df_1.empty:
+                    s_idx = available_subjects.index(sel_pig_1) if sel_pig_1 in available_subjects else 0
+                    p_color = MULTI_PALETTE[s_idx % len(MULTI_PALETTE)]
+
+                    hover_texts = pig_df_1.apply(lambda r: (
+                        f"<b>{r['Intervention Label']}</b><br>"
+                        f"Δ {stat_sensor}: {r[f'{stat_sensor} Δ (Post - Pre)']}<br>"
+                        f"---<br>"
+                        f"Pre (Rest): {r[f'{stat_sensor} Pre Mean']} ± {r[f'{stat_sensor} Pre SD']} (Min: {r[f'{stat_sensor} Pre Min']}, Max: {r[f'{stat_sensor} Pre Max']})<br>"
+                        f"Post (Active): {r[f'{stat_sensor} Post Mean']} ± {r[f'{stat_sensor} Post SD']} (Min: {r[f'{stat_sensor} Post Min']}, Max: {r[f'{stat_sensor} Post Max']})"
+                    ), axis=1)
+
+                    fig1 = go.Figure()
+                    fig1.add_trace(go.Bar(
+                        x=pig_df_1['Intervention Label'],
+                        y=pig_df_1[f'{stat_sensor} Δ (Post - Pre)'],
+                        marker_color=p_color,
+                        text=pig_df_1[f'{stat_sensor} Δ (Post - Pre)'].apply(lambda x: f"{x:.1f}"),
+                        textposition='auto',
+                        hovertext=hover_texts,
+                        hoverinfo='text'
+                    ))
+
+                    fig1.update_layout(
+                        title=dict(
+                            text=f"<b>Delta (Δ) for {sel_pig_1}</b><br><sup>Shows all individual intervention runs</sup>",
+                            font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
+                        yaxis_title=f"Δ {stat_sensor} (mmHg)",
+                        paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
+                        font=dict(family="IBM Plex Sans", color="#8b949e"),
+                        xaxis=dict(gridcolor="#21262d", linecolor="#30363d", showgrid=False),
+                        yaxis=dict(gridcolor="#21262d", linecolor="#30363d")
+                    )
+                    st.plotly_chart(fig1, use_container_width=True)
+                else:
+                    st.info("No delta data available for this subject.")
+
+            # TAB 2: Before vs After per Pig
+            with tab2:
+                sel_pig_2 = st.selectbox("Select Subject:", available_subjects, key="t2_pig")
+                pig_df_2 = stats_df[stats_df['Subject ID'] == sel_pig_2].dropna(
+                    subset=[f'{stat_sensor} Pre Mean', f'{stat_sensor} Post Mean'])
+
+                if not pig_df_2.empty:
+                    s_idx = available_subjects.index(sel_pig_2) if sel_pig_2 in available_subjects else 0
+                    p_color = MULTI_PALETTE[s_idx % len(MULTI_PALETTE)]
+
+                    hover_pre = pig_df_2.apply(lambda
+                                                   r: f"Pre Mean: {r[f'{stat_sensor} Pre Mean']}<br>SD: {r[f'{stat_sensor} Pre SD']}<br>Min: {r[f'{stat_sensor} Pre Min']}<br>Max: {r[f'{stat_sensor} Pre Max']}",
+                                               axis=1)
+                    hover_post = pig_df_2.apply(lambda
+                                                    r: f"Post Mean: {r[f'{stat_sensor} Post Mean']}<br>SD: {r[f'{stat_sensor} Post SD']}<br>Min: {r[f'{stat_sensor} Post Min']}<br>Max: {r[f'{stat_sensor} Post Max']}",
+                                                axis=1)
+
+                    fig2 = go.Figure()
+                    fig2.add_trace(go.Bar(
+                        x=pig_df_2['Intervention Label'],
+                        y=pig_df_2[f'{stat_sensor} Pre Mean'],
+                        name='Baseline (Pre)',
+                        marker_color='#8b949e',
+                        error_y=dict(type='data', array=pig_df_2[f'{stat_sensor} Pre SD'], visible=True,
+                                     color="#c9d1d9", thickness=1.5),
+                        hovertext=hover_pre,
+                        hoverinfo='text+x+name'
+                    ))
+                    fig2.add_trace(go.Bar(
+                        x=pig_df_2['Intervention Label'],
+                        y=pig_df_2[f'{stat_sensor} Post Mean'],
+                        name='Intervention (Post)',
+                        marker_color=p_color,
+                        error_y=dict(type='data', array=pig_df_2[f'{stat_sensor} Post SD'], visible=True,
+                                     color="#c9d1d9", thickness=1.5),
+                        hovertext=hover_post,
+                        hoverinfo='text+x+name'
+                    ))
+
+                    fig2.update_layout(
+                        barmode='group',
+                        title=dict(
+                            text=f"<b>Before vs After for {sel_pig_2}</b><br><sup>Shows individual intervention runs with exact 30s Standard Deviation</sup>",
+                            font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
+                        yaxis_title=f"{stat_sensor} Mean (mmHg)",
+                        paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
+                        font=dict(family="IBM Plex Sans", color="#8b949e"),
+                        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
+                        xaxis=dict(gridcolor="#21262d", linecolor="#30363d", showgrid=False),
+                        yaxis=dict(gridcolor="#21262d", linecolor="#30363d")
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+                else:
+                    st.info("No Pre/Post data available for this subject.")
+
+            # TAB 3: Per Intervention across Pigs
+            with tab3:
+                available_conds = sorted(stats_df['Clean Condition'].unique())
+                if available_conds:
+                    sel_cond = st.selectbox("Select Cleaned Intervention:", available_conds, key="t3_cond")
+                    cond_df = stats_df[stats_df['Clean Condition'] == sel_cond].dropna(
+                        subset=[f'{stat_sensor} Δ (Post - Pre)'])
+
+                    if not cond_df.empty:
+                        # Create unique X-axis label by combining Subject ID and Run ID
+                        cond_df['Pig_Run'] = cond_df['Subject ID'] + " (Run " + cond_df['Run ID'].astype(str) + ")"
+
+                        fig3 = go.Figure()
+
+                        # Add bars iteratively to color-code by Pig
+                        for subj in cond_df['Subject ID'].unique():
+                            s_df = cond_df[cond_df['Subject ID'] == subj]
+                            s_idx = available_subjects.index(subj) if subj in available_subjects else 0
+                            p_color = MULTI_PALETTE[s_idx % len(MULTI_PALETTE)]
+
+                            hover_texts = s_df.apply(lambda r: (
+                                f"<b>{r['Subject ID']} - Run {r['Run ID']}</b><br>"
+                                f"Δ {stat_sensor}: {r[f'{stat_sensor} Δ (Post - Pre)']}<br>"
+                                f"---<br>"
+                                f"Pre: {r[f'{stat_sensor} Pre Mean']} ± {r[f'{stat_sensor} Pre SD']} (Min: {r[f'{stat_sensor} Pre Min']}, Max: {r[f'{stat_sensor} Pre Max']})<br>"
+                                f"Post: {r[f'{stat_sensor} Post Mean']} ± {r[f'{stat_sensor} Post SD']} (Min: {r[f'{stat_sensor} Post Min']}, Max: {r[f'{stat_sensor} Post Max']})"
+                            ), axis=1)
+
+                            fig3.add_trace(go.Bar(
+                                name=subj,
+                                x=s_df['Pig_Run'],
+                                y=s_df[f'{stat_sensor} Δ (Post - Pre)'],
+                                marker_color=p_color,
+                                text=s_df[f'{stat_sensor} Δ (Post - Pre)'].apply(lambda x: f"{x:.1f}"),
+                                textposition='auto',
+                                hovertext=hover_texts,
+                                hoverinfo='text'
+                            ))
+
+                        fig3.update_layout(
+                            barmode='group',
+                            title=dict(
+                                text=f"<b>Delta (Δ) for {sel_cond} Across Cohort</b><br><sup>Shows all individual runs across all selected subjects</sup>",
+                                font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
+                            yaxis_title=f"Δ {stat_sensor} (mmHg)",
+                            paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
+                            font=dict(family="IBM Plex Sans", color="#8b949e"),
+                            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
+                            xaxis=dict(gridcolor="#21262d", linecolor="#30363d", showgrid=False),
+                            yaxis=dict(gridcolor="#21262d", linecolor="#30363d")
+                        )
+                        st.plotly_chart(fig3, use_container_width=True)
+                    else:
+                        st.info("No delta data available for this intervention.")
+                else:
+                    st.info("No cleaned conditions available.")
 
             # --- Downloads for Stats ---
             csv_stats = stats_df.to_csv(index=False).encode('utf-8')
