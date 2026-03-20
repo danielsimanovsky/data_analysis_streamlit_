@@ -1044,9 +1044,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
 </div>
 """, unsafe_allow_html=True)
 
-    st.warning(
-        "⚠️ **Clinical Statistics Note:** The individual *P-Values* calculated below compare the high-frequency data array of the active window against the baseline window for a *single* run. Due to the immense number of data points ($n \\approx 3000$ per 30s) and time-series autocorrelation, these individual p-values are highly susceptible to significance inflation. For publication claims, rely on cohort-level repeated-measures tests across multiple pigs rather than individual intra-run p-values.")
-
+    
     col_ctrl1, col_ctrl2 = st.columns(2)
     with col_ctrl1:
         stat_window_sel = st.selectbox("Analysis Window (Duration before/after trigger):",
