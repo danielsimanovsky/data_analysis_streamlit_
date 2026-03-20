@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import scipy.stats as stats
 import glob
 import os
 import zipfile
@@ -170,17 +171,19 @@ st.markdown("""
         color: #ff7b72 !important;
     }
 
-    /* Download button */
-    .stDownloadButton button {
+    /* Download / Normal Buttons */
+    .stDownloadButton button, .stButton button {
         background-color: #21262d !important;
         color: #c9d1d9 !important;
         border: 1px solid #30363d !important;
         border-radius: 6px !important;
         font-family: 'IBM Plex Mono', monospace !important;
-        font-size: 0.8rem !important;
+        font-size: 0.75rem !important;
         transition: all 0.15s ease !important;
+        padding-top: 0.25rem !important;
+        padding-bottom: 0.25rem !important;
     }
-    .stDownloadButton button:hover {
+    .stDownloadButton button:hover, .stButton button:hover {
         background-color: #30363d !important;
         border-color: #58a6ff !important;
         color: #58a6ff !important;
@@ -205,13 +208,33 @@ st.markdown("""
         background-color: #161b22 !important;
     }
 
-    /* Scrollbar */
+    /* Scrollbars */
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: #0d1117; }
     ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
 
-    /* Tabs */
+    /* Scrollable Tabs */
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"] {
+        overflow-x: auto !important;
+        overflow-y: hidden !important;
+        padding-bottom: 8px !important;
+        scrollbar-width: thin;
+        scrollbar-color: #30363d transparent;
+    }
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"]::-webkit-scrollbar {
+        height: 6px;
+    }
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"]::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"]::-webkit-scrollbar-thumb {
+        background-color: #30363d;
+        border-radius: 3px;
+    }
+    div[data-testid="stTabs"] > div[data-baseweb="tab"] {
+        white-space: nowrap !important;
+    }
     [data-testid="stTabs"] button {
         font-family: 'IBM Plex Sans', sans-serif !important;
         font-weight: 500 !important;
@@ -241,6 +264,11 @@ MULTI_PALETTE = [
 
 
 # --- Helper Functions ---
+
+def update_sel(key, vals):
+    """Callback helper to safely update session state for quick select buttons."""
+    st.session_state[key] = vals
+
 
 def clean_condition_name(raw_name):
     """
@@ -422,11 +450,12 @@ def get_raw_data_slice(file_path, time_bin, agg_mode="30s"):
         return pd.DataFrame()
 
 
-def extract_pre_post_stats(files_df, sensors_to_calc, available_map):
+def extract_pre_post_stats(files_df, sensors_to_calc, available_map, window_sec=30, metric="Mean"):
     """
-    Extracts exact 30-sec pre/post statistics.
-    Pre = Last 30s of REST in the PREVIOUS file.
-    Post = First 30s of ACTIVE in the CURRENT file.
+    Extracts exact pre/post statistics based on window_sec.
+    Pre = Last window_sec of REST in the PREVIOUS file.
+    Post = First window_sec of ACTIVE in the CURRENT file.
+    Calculates P-Values per run dynamically using scipy.stats.
     """
     results = []
     subjects = files_df['subject_id'].unique()
@@ -454,7 +483,7 @@ def extract_pre_post_stats(files_df, sensors_to_calc, available_map):
 
                 t_start_active = exp_starts['elapsed [sec]'].iloc[0]
                 post_df = curr_df[(curr_df['elapsed [sec]'] >= t_start_active) &
-                                  (curr_df['elapsed [sec]'] <= t_start_active + 30)]
+                                  (curr_df['elapsed [sec]'] <= t_start_active + window_sec)]
 
                 # --- 2. PRE (Previous File Rest Part) ---
                 prev_df = pd.read_csv(prev_path, skiprows=4)
@@ -465,7 +494,7 @@ def extract_pre_post_stats(files_df, sensors_to_calc, available_map):
                     if rest_part.empty:
                         rest_part = prev_df  # Fallback
                     t_end_rest = rest_part['elapsed [sec]'].max()
-                    pre_df = rest_part[(rest_part['elapsed [sec]'] >= t_end_rest - 30) &
+                    pre_df = rest_part[(rest_part['elapsed [sec]'] >= t_end_rest - window_sec) &
                                        (rest_part['elapsed [sec]'] <= t_end_rest)]
 
                 row_data = {
@@ -478,39 +507,70 @@ def extract_pre_post_stats(files_df, sensors_to_calc, available_map):
                 for label in sensors_to_calc:
                     raw_col = available_map[label].replace("_mean", "")
                     if raw_col in curr_df.columns:
-                        # Baseline (Pre)
-                        if not pre_df.empty and raw_col in pre_df.columns:
-                            row_data[f'{label} Pre Mean'] = round(pre_df[raw_col].mean(), 2)
-                            row_data[f'{label} Pre SD'] = round(pre_df[raw_col].std(), 2)
-                            row_data[f'{label} Pre Min'] = round(pre_df[raw_col].min(), 2)
-                            row_data[f'{label} Pre Max'] = round(pre_df[raw_col].max(), 2)
+
+                        pre_data = pre_df[
+                            raw_col].dropna() if not pre_df.empty and raw_col in pre_df.columns else pd.Series(
+                            dtype=float)
+                        post_data = post_df[raw_col].dropna() if not post_df.empty else pd.Series(dtype=float)
+
+                        # Core Values (Always keep SD/Min/Max for variance context)
+                        if not pre_data.empty:
+                            row_data[f'{label} Pre {metric}'] = round(
+                                pre_data.mean() if metric == "Mean" else pre_data.median(), 2)
+                            row_data[f'{label} Pre SD'] = round(pre_data.std(), 2)
+                            row_data[f'{label} Pre Min'] = round(pre_data.min(), 2)
+                            row_data[f'{label} Pre Max'] = round(pre_data.max(), 2)
                         else:
-                            row_data[f'{label} Pre Mean'] = pd.NA
+                            row_data[f'{label} Pre {metric}'] = pd.NA
                             row_data[f'{label} Pre SD'] = pd.NA
                             row_data[f'{label} Pre Min'] = pd.NA
                             row_data[f'{label} Pre Max'] = pd.NA
 
-                        # Experiment (Post)
-                        if not post_df.empty:
-                            row_data[f'{label} Post Mean'] = round(post_df[raw_col].mean(), 2)
-                            row_data[f'{label} Post SD'] = round(post_df[raw_col].std(), 2)
-                            row_data[f'{label} Post Min'] = round(post_df[raw_col].min(), 2)
-                            row_data[f'{label} Post Max'] = round(post_df[raw_col].max(), 2)
+                        if not post_data.empty:
+                            row_data[f'{label} Post {metric}'] = round(
+                                post_data.mean() if metric == "Mean" else post_data.median(), 2)
+                            row_data[f'{label} Post SD'] = round(post_data.std(), 2)
+                            row_data[f'{label} Post Min'] = round(post_data.min(), 2)
+                            row_data[f'{label} Post Max'] = round(post_data.max(), 2)
                         else:
-                            row_data[f'{label} Post Mean'] = pd.NA
+                            row_data[f'{label} Post {metric}'] = pd.NA
                             row_data[f'{label} Post SD'] = pd.NA
                             row_data[f'{label} Post Min'] = pd.NA
                             row_data[f'{label} Post Max'] = pd.NA
 
-                        # Delta & Error Propagation
-                        if not pre_df.empty and not post_df.empty and raw_col in pre_df.columns:
-                            row_data[f'{label} Δ (Post - Pre)'] = round(
-                                post_df[raw_col].mean() - pre_df[raw_col].mean(), 2)
-                            row_data[f'{label} Δ SD'] = round(
-                                (pre_df[raw_col].std() ** 2 + post_df[raw_col].std() ** 2) ** 0.5, 2)
+                        # Delta & P-Value logic
+                        if not pre_data.empty and not post_data.empty:
+                            if metric == 'Mean':
+                                delta_val = post_data.mean() - pre_data.mean()
+                                row_data[f'{label} Δ'] = round(delta_val, 2)
+                                row_data[f'{label} Δ SD'] = round((pre_data.std() ** 2 + post_data.std() ** 2) ** 0.5,
+                                                                  2)  # Propagation of Error
+
+                                if len(pre_data) > 1 and len(post_data) > 1:
+                                    _, p_val = stats.ttest_ind(post_data, pre_data, equal_var=False)
+                                else:
+                                    p_val = pd.NA
+                            else:  # Median
+                                delta_val = post_data.median() - pre_data.median()
+                                row_data[f'{label} Δ'] = round(delta_val, 2)
+                                row_data[f'{label} Δ SD'] = pd.NA
+
+                                if len(pre_data) > 1 and len(post_data) > 1:
+                                    _, p_val = stats.mannwhitneyu(post_data, pre_data, alternative='two-sided')
+                                else:
+                                    p_val = pd.NA
+
+                            if pd.isna(p_val):
+                                row_data[f'{label} P-Value'] = "N/A"
+                            elif p_val < 0.001:
+                                row_data[f'{label} P-Value'] = "<0.001"
+                            else:
+                                row_data[f'{label} P-Value'] = f"{p_val:.3f}"
+
                         else:
-                            row_data[f'{label} Δ (Post - Pre)'] = pd.NA
+                            row_data[f'{label} Δ'] = pd.NA
                             row_data[f'{label} Δ SD'] = pd.NA
+                            row_data[f'{label} P-Value'] = pd.NA
 
                 results.append(row_data)
             except Exception:
@@ -621,11 +681,24 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
         available_subjects = list(df_all['subject_id'].unique())
 
-        # Multi-select to allow viewing multiple pigs
+        # --- Quick Select Buttons for Subjects ---
+        if "subject_multi" not in st.session_state:
+            st.session_state.subject_multi = [available_subjects[0]] if available_subjects else []
+        else:
+            st.session_state.subject_multi = [s for s in st.session_state.subject_multi if s in available_subjects]
+            if not st.session_state.subject_multi and available_subjects:
+                st.session_state.subject_multi = [available_subjects[0]]
+
+        c1, c2 = st.columns(2)
+        c1.button("All Subjects", on_click=update_sel, args=("subject_multi", available_subjects), key="btn_all_subj",
+                  use_container_width=True)
+        c2.button("Clear Subjects", on_click=update_sel, args=("subject_multi", []), key="btn_clr_subj",
+                  use_container_width=True)
+
         selected_subjects = st.multiselect(
             "Select Subject(s) for Visualization:",
             options=available_subjects,
-            default=[available_subjects[0]],
+            key="subject_multi",
             help="Select one or more Pigs to view in the Time-Series chart. (The Stats table below will always calculate for ALL loaded pigs)."
         )
 
@@ -670,10 +743,26 @@ with tempfile.TemporaryDirectory() as temp_dir:
             st.error("No expected sensors found.")
             st.stop()
 
+        available_sensor_keys = list(available_map.keys())
+
+        # --- Quick Select Buttons for Sensors ---
+        if "sensor_multi" not in st.session_state:
+            st.session_state.sensor_multi = [available_sensor_keys[0]] if available_sensor_keys else []
+        else:
+            st.session_state.sensor_multi = [s for s in st.session_state.sensor_multi if s in available_sensor_keys]
+            if not st.session_state.sensor_multi and available_sensor_keys:
+                st.session_state.sensor_multi = [available_sensor_keys[0]]
+
+        c1, c2 = st.columns(2)
+        c1.button("All Sensors", on_click=update_sel, args=("sensor_multi", available_sensor_keys), key="btn_all_sens",
+                  use_container_width=True)
+        c2.button("Clear Sensors", on_click=update_sel, args=("sensor_multi", []), key="btn_clr_sens",
+                  use_container_width=True)
+
         selected_sensor_labels = st.multiselect(
             "Select Sensors:",
-            options=list(available_map.keys()),
-            default=[list(available_map.keys())[0]]
+            options=available_sensor_keys,
+            key="sensor_multi"
         )
 
         if not selected_sensor_labels:
@@ -954,55 +1043,78 @@ with tempfile.TemporaryDirectory() as temp_dir:
     <div style="font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8b949e; margin-top:4px;">ADJACENT EXPERIMENT COMPARISON</div>
 </div>
 """, unsafe_allow_html=True)
+
+    st.warning(
+        "⚠️ **Clinical Statistics Note:** The individual *P-Values* calculated below compare the high-frequency data array of the active window against the baseline window for a *single* run. Due to the immense number of data points ($n \\approx 3000$ per 30s) and time-series autocorrelation, these individual p-values are highly susceptible to significance inflation. For publication claims, rely on cohort-level repeated-measures tests across multiple pigs rather than individual intra-run p-values.")
+
+    col_ctrl1, col_ctrl2 = st.columns(2)
+    with col_ctrl1:
+        stat_window_sel = st.selectbox("Analysis Window (Duration before/after trigger):",
+                                       ["30 seconds", "60 seconds (1 minute)"])
+        window_sec = 60 if "60" in stat_window_sel else 30
+    with col_ctrl2:
+        stat_metric = st.selectbox("Central Tendency Metric:", ["Mean", "Median"])
+
     st.caption(
-        "Calculates stats by comparing the **last 30s of REST in the PREVIOUS file** against the **first 30s of ACTIVE intervention in the CURRENT file**. This correctly pairs your active phases with their true preceding baseline. Results are filtered by your current respiratory phase selection.")
+        f"Calculates stats by comparing the **last {window_sec}s of REST in the PREVIOUS file** against the **first {window_sec}s of ACTIVE intervention in the CURRENT file**. Results are filtered by your current respiratory phase selection.")
 
     # We pull files from df_all_raw (which contains ALL files, unfiltered, to preserve chronological order for baselines)
     stats_input_df = df_all_raw[['source_path', 'subject_id', 'condition']].drop_duplicates()
 
     if not stats_input_df.empty:
-        with st.spinner("Calculating rigorous Pre/Post statistics across all subjects..."):
-            stats_df = extract_pre_post_stats(stats_input_df, selected_sensor_labels, available_map)
+        with st.spinner(
+                f"Calculating rigorous Pre/Post statistics across all subjects ({stat_metric}, {window_sec}s)..."):
+            stats_df = extract_pre_post_stats(stats_input_df, selected_sensor_labels, available_map, window_sec,
+                                              stat_metric)
 
         if not stats_df.empty:
 
             # Apply regex text cleaning to standardise 'Expirium 40', 'Inspirium 80', etc.
             stats_df['Clean Condition'] = stats_df['Condition Raw'].apply(clean_condition_name)
 
-            # To handle multiple runs of the same condition for the same pig
-            stats_df['Run ID'] = stats_df.groupby(['Subject ID', 'Clean Condition']).cumcount() + 1
-            stats_df['Intervention Label'] = stats_df['Clean Condition'] + " (Run " + stats_df['Run ID'].astype(
-                str) + ")"
-
-            # Apply UI phase filter to the output so we only see the relevant rows
-            if phase_filter == "Inspirium Only":
-                stats_df = stats_df[stats_df['Clean Condition'].str.contains('Inspirium', na=False)]
-            elif phase_filter == "Expirium Only":
-                stats_df = stats_df[stats_df['Clean Condition'].str.contains('Expirium', na=False)]
-
-            st.dataframe(stats_df, use_container_width=True)
-
-            # --- New: Statistical Visualizations (Bar Graphs) ---
+            # --- Visualizations Settings UI ---
             st.markdown("""
             <div style="margin:2.5rem 0 1rem 0; padding:0.75rem 1rem; background:#161b22; border:1px solid #21262d; border-left:3px solid #9467bd; border-radius:6px;">
-                <div style="font-family:'IBM Plex Sans',sans-serif; font-size:1rem; font-weight:500; color:#e6edf3;">📈 Statistical Visualizations (Bar Graphs)</div>
+                <div style="font-family:'IBM Plex Sans',sans-serif; font-size:1rem; font-weight:500; color:#e6edf3;">📈 Statistical Visualizations (Bar Graphs & Box Plots)</div>
                 <div style="font-family:'IBM Plex Mono',monospace; font-size:0.72rem; color:#8b949e; margin-top:4px;">MULTI-RUN PAIRED COMPARISONS & COHORT VARIABILITY</div>
             </div>
             """, unsafe_allow_html=True)
 
-            stat_sensor = st.selectbox("Select Sensor to Visualize:", selected_sensor_labels, key="stat_sensor_select")
+            col_v1, col_v2 = st.columns([1, 1])
+            with col_v1:
+                stat_sensor = st.selectbox("Select Sensor to Visualize:", selected_sensor_labels,
+                                           key="stat_sensor_select")
+            with col_v2:
+                st.write("")  # Spacing to align with selectbox
+                use_raw_names = st.checkbox("Use Raw (Uncleaned) Condition Names",
+                                            help="Toggle this to use the original messy text from the CSV files instead of the auto-cleaned versions.")
 
-            tab1, tab2, tab3 = st.tabs([
-                "📊 1. Overall Delta (Per Pig)",
-                "📊 2. Before vs After (Per Pig)",
-                "📊 3. Intervention Comparison (Across Cohort)"
+            cond_col = 'Condition Raw' if use_raw_names else 'Clean Condition'
+
+            # To handle multiple runs of the same condition for the same pig
+            stats_df['Run ID'] = stats_df.groupby(['Subject ID', cond_col]).cumcount() + 1
+            stats_df['Intervention Label'] = stats_df[cond_col] + " (Run " + stats_df['Run ID'].astype(str) + ")"
+
+            # Apply UI phase filter to the output so we only see the relevant rows
+            if phase_filter == "Inspirium Only":
+                stats_df = stats_df[stats_df['Condition Raw'].str.lower().str.contains('insp', na=False)]
+            elif phase_filter == "Expirium Only":
+                stats_df = stats_df[stats_df['Condition Raw'].str.lower().str.contains('exp|exs', na=False)]
+
+            st.dataframe(stats_df, use_container_width=True)
+
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                f"📊 1. Overall Delta ({stat_metric} Per Pig)",
+                f"📊 2. Before vs After ({stat_metric} Per Pig)",
+                f"📊 3. Intervention Comparison ({stat_metric} Across Cohort)",
+                f"📊 4. Cohort Before vs After (Multi-Intervention)",
+                f"📊 5. Cohort Deltas (Multi-Intervention)"
             ])
 
             # TAB 1: Delta per Pig
             with tab1:
                 sel_pig_1 = st.selectbox("Select Subject:", available_subjects, key="t1_pig")
-                pig_df_1 = stats_df[stats_df['Subject ID'] == sel_pig_1].dropna(
-                    subset=[f'{stat_sensor} Δ (Post - Pre)'])
+                pig_df_1 = stats_df[stats_df['Subject ID'] == sel_pig_1].dropna(subset=[f'{stat_sensor} Δ'])
 
                 if not pig_df_1.empty:
                     s_idx = available_subjects.index(sel_pig_1) if sel_pig_1 in available_subjects else 0
@@ -1010,18 +1122,20 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
                     hover_texts = pig_df_1.apply(lambda r: (
                         f"<b>{r['Intervention Label']}</b><br>"
-                        f"Δ {stat_sensor}: {r[f'{stat_sensor} Δ (Post - Pre)']}<br>"
+                        f"Δ {stat_sensor}: {r[f'{stat_sensor} Δ']}<br>"
+                        f"P-Value (intra-run): {r[f'{stat_sensor} P-Value']}<br>"
                         f"---<br>"
-                        f"Pre (Rest): {r[f'{stat_sensor} Pre Mean']} ± {r[f'{stat_sensor} Pre SD']} (Min: {r[f'{stat_sensor} Pre Min']}, Max: {r[f'{stat_sensor} Pre Max']})<br>"
-                        f"Post (Active): {r[f'{stat_sensor} Post Mean']} ± {r[f'{stat_sensor} Post SD']} (Min: {r[f'{stat_sensor} Post Min']}, Max: {r[f'{stat_sensor} Post Max']})"
+                        f"Pre (Rest): {r[f'{stat_sensor} Pre {stat_metric}']} (Min: {r[f'{stat_sensor} Pre Min']}, Max: {r[f'{stat_sensor} Pre Max']})<br>"
+                        f"Post (Active): {r[f'{stat_sensor} Post {stat_metric}']} (Min: {r[f'{stat_sensor} Post Min']}, Max: {r[f'{stat_sensor} Post Max']})"
                     ), axis=1)
 
                     fig1 = go.Figure()
+
                     fig1.add_trace(go.Bar(
                         x=pig_df_1['Intervention Label'],
-                        y=pig_df_1[f'{stat_sensor} Δ (Post - Pre)'],
+                        y=pig_df_1[f'{stat_sensor} Δ'],
                         marker_color=p_color,
-                        text=pig_df_1[f'{stat_sensor} Δ (Post - Pre)'].apply(lambda x: f"{x:.1f}"),
+                        text=pig_df_1[f'{stat_sensor} Δ'].apply(lambda x: f"{x:.1f}"),
                         textposition='auto',
                         hovertext=hover_texts,
                         hoverinfo='text'
@@ -1029,9 +1143,9 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
                     fig1.update_layout(
                         title=dict(
-                            text=f"<b>Delta (Δ) for {sel_pig_1}</b><br><sup>Shows all individual intervention runs</sup>",
+                            text=f"<b>Delta (Δ) for {sel_pig_1}</b><br><sup>Shows all individual intervention runs ({stat_metric})</sup>",
                             font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
-                        yaxis_title=f"Δ {stat_sensor} (mmHg)",
+                        yaxis_title=f"Δ {stat_sensor} ({stat_metric} mmHg)",
                         paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
                         font=dict(family="IBM Plex Sans", color="#8b949e"),
                         xaxis=dict(gridcolor="#21262d", linecolor="#30363d", showgrid=False),
@@ -1045,47 +1159,52 @@ with tempfile.TemporaryDirectory() as temp_dir:
             with tab2:
                 sel_pig_2 = st.selectbox("Select Subject:", available_subjects, key="t2_pig")
                 pig_df_2 = stats_df[stats_df['Subject ID'] == sel_pig_2].dropna(
-                    subset=[f'{stat_sensor} Pre Mean', f'{stat_sensor} Post Mean'])
+                    subset=[f'{stat_sensor} Pre {stat_metric}', f'{stat_sensor} Post {stat_metric}'])
 
                 if not pig_df_2.empty:
                     s_idx = available_subjects.index(sel_pig_2) if sel_pig_2 in available_subjects else 0
                     p_color = MULTI_PALETTE[s_idx % len(MULTI_PALETTE)]
 
                     hover_pre = pig_df_2.apply(lambda
-                                                   r: f"Pre Mean: {r[f'{stat_sensor} Pre Mean']}<br>SD: {r[f'{stat_sensor} Pre SD']}<br>Min: {r[f'{stat_sensor} Pre Min']}<br>Max: {r[f'{stat_sensor} Pre Max']}",
+                                                   r: f"Pre {stat_metric}: {r[f'{stat_sensor} Pre {stat_metric}']}<br>SD: {r[f'{stat_sensor} Pre SD']}<br>Min: {r[f'{stat_sensor} Pre Min']}<br>Max: {r[f'{stat_sensor} Pre Max']}",
                                                axis=1)
                     hover_post = pig_df_2.apply(lambda
-                                                    r: f"Post Mean: {r[f'{stat_sensor} Post Mean']}<br>SD: {r[f'{stat_sensor} Post SD']}<br>Min: {r[f'{stat_sensor} Post Min']}<br>Max: {r[f'{stat_sensor} Post Max']}",
+                                                    r: f"Post {stat_metric}: {r[f'{stat_sensor} Post {stat_metric}']}<br>SD: {r[f'{stat_sensor} Post SD']}<br>P-Value (vs Baseline): {r[f'{stat_sensor} P-Value']}<br>Min: {r[f'{stat_sensor} Post Min']}<br>Max: {r[f'{stat_sensor} Post Max']}",
                                                 axis=1)
 
                     fig2 = go.Figure()
+
+                    kwargs_err_pre = dict(type='data', array=pig_df_2[f'{stat_sensor} Pre SD'], visible=True,
+                                          color="#c9d1d9", thickness=1.5) if stat_metric == 'Mean' else None
+                    kwargs_err_post = dict(type='data', array=pig_df_2[f'{stat_sensor} Post SD'], visible=True,
+                                           color="#c9d1d9", thickness=1.5) if stat_metric == 'Mean' else None
+
                     fig2.add_trace(go.Bar(
                         x=pig_df_2['Intervention Label'],
-                        y=pig_df_2[f'{stat_sensor} Pre Mean'],
+                        y=pig_df_2[f'{stat_sensor} Pre {stat_metric}'],
                         name='Baseline (Pre)',
                         marker_color='#8b949e',
-                        error_y=dict(type='data', array=pig_df_2[f'{stat_sensor} Pre SD'], visible=True,
-                                     color="#c9d1d9", thickness=1.5),
+                        error_y=kwargs_err_pre,
                         hovertext=hover_pre,
                         hoverinfo='text+x+name'
                     ))
                     fig2.add_trace(go.Bar(
                         x=pig_df_2['Intervention Label'],
-                        y=pig_df_2[f'{stat_sensor} Post Mean'],
+                        y=pig_df_2[f'{stat_sensor} Post {stat_metric}'],
                         name='Intervention (Post)',
                         marker_color=p_color,
-                        error_y=dict(type='data', array=pig_df_2[f'{stat_sensor} Post SD'], visible=True,
-                                     color="#c9d1d9", thickness=1.5),
+                        error_y=kwargs_err_post,
                         hovertext=hover_post,
                         hoverinfo='text+x+name'
                     ))
 
+                    sd_note = " with Standard Deviation" if stat_metric == 'Mean' else ""
                     fig2.update_layout(
                         barmode='group',
                         title=dict(
-                            text=f"<b>Before vs After for {sel_pig_2}</b><br><sup>Shows individual intervention runs with exact 30s Standard Deviation</sup>",
+                            text=f"<b>Before vs After for {sel_pig_2}</b><br><sup>Shows individual intervention runs{sd_note}</sup>",
                             font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
-                        yaxis_title=f"{stat_sensor} Mean (mmHg)",
+                        yaxis_title=f"{stat_sensor} {stat_metric} (mmHg)",
                         paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
                         font=dict(family="IBM Plex Sans", color="#8b949e"),
                         legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
@@ -1098,19 +1217,16 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
             # TAB 3: Per Intervention across Pigs
             with tab3:
-                available_conds = sorted(stats_df['Clean Condition'].unique())
+                available_conds = sorted(stats_df[cond_col].astype(str).unique())
                 if available_conds:
-                    sel_cond = st.selectbox("Select Cleaned Intervention:", available_conds, key="t3_cond")
-                    cond_df = stats_df[stats_df['Clean Condition'] == sel_cond].dropna(
-                        subset=[f'{stat_sensor} Δ (Post - Pre)'])
+                    sel_cond = st.selectbox("Select Intervention:", available_conds, key="t3_cond")
+                    cond_df = stats_df[stats_df[cond_col] == sel_cond].dropna(subset=[f'{stat_sensor} Δ'])
 
                     if not cond_df.empty:
-                        # Create unique X-axis label by combining Subject ID and Run ID
                         cond_df['Pig_Run'] = cond_df['Subject ID'] + " (Run " + cond_df['Run ID'].astype(str) + ")"
 
                         fig3 = go.Figure()
 
-                        # Add bars iteratively to color-code by Pig
                         for subj in cond_df['Subject ID'].unique():
                             s_df = cond_df[cond_df['Subject ID'] == subj]
                             s_idx = available_subjects.index(subj) if subj in available_subjects else 0
@@ -1118,18 +1234,19 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
                             hover_texts = s_df.apply(lambda r: (
                                 f"<b>{r['Subject ID']} - Run {r['Run ID']}</b><br>"
-                                f"Δ {stat_sensor}: {r[f'{stat_sensor} Δ (Post - Pre)']}<br>"
+                                f"Δ {stat_sensor}: {r[f'{stat_sensor} Δ']}<br>"
+                                f"P-Value (intra-run): {r[f'{stat_sensor} P-Value']}<br>"
                                 f"---<br>"
-                                f"Pre: {r[f'{stat_sensor} Pre Mean']} ± {r[f'{stat_sensor} Pre SD']} (Min: {r[f'{stat_sensor} Pre Min']}, Max: {r[f'{stat_sensor} Pre Max']})<br>"
-                                f"Post: {r[f'{stat_sensor} Post Mean']} ± {r[f'{stat_sensor} Post SD']} (Min: {r[f'{stat_sensor} Post Min']}, Max: {r[f'{stat_sensor} Post Max']})"
+                                f"Pre: {r[f'{stat_sensor} Pre {stat_metric}']} (Min: {r[f'{stat_sensor} Pre Min']}, Max: {r[f'{stat_sensor} Pre Max']})<br>"
+                                f"Post: {r[f'{stat_sensor} Post {stat_metric}']} (Min: {r[f'{stat_sensor} Post Min']}, Max: {r[f'{stat_sensor} Post Max']})"
                             ), axis=1)
 
                             fig3.add_trace(go.Bar(
                                 name=subj,
                                 x=s_df['Pig_Run'],
-                                y=s_df[f'{stat_sensor} Δ (Post - Pre)'],
+                                y=s_df[f'{stat_sensor} Δ'],
                                 marker_color=p_color,
-                                text=s_df[f'{stat_sensor} Δ (Post - Pre)'].apply(lambda x: f"{x:.1f}"),
+                                text=s_df[f'{stat_sensor} Δ'].apply(lambda x: f"{x:.1f}"),
                                 textposition='auto',
                                 hovertext=hover_texts,
                                 hoverinfo='text'
@@ -1138,7 +1255,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
                         fig3.update_layout(
                             barmode='group',
                             title=dict(
-                                text=f"<b>Delta (Δ) for {sel_cond} Across Cohort</b><br><sup>Shows all individual runs across all selected subjects</sup>",
+                                text=f"<b>Delta (Δ) for '{sel_cond}' Across Cohort</b><br><sup>Shows all individual runs across all selected subjects ({stat_metric})</sup>",
                                 font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
                             yaxis_title=f"Δ {stat_sensor} (mmHg)",
                             paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
@@ -1151,7 +1268,225 @@ with tempfile.TemporaryDirectory() as temp_dir:
                     else:
                         st.info("No delta data available for this intervention.")
                 else:
-                    st.info("No cleaned conditions available.")
+                    st.info("No conditions available.")
+
+            # TAB 4: Cohort Before vs After (Multi-Intervention)
+            with tab4:
+                available_conds_4 = sorted(stats_df[cond_col].astype(str).unique())
+                if available_conds_4:
+
+                    if "t4_conds" not in st.session_state:
+                        st.session_state.t4_conds = available_conds_4[:2] if len(
+                            available_conds_4) >= 2 else available_conds_4
+                    else:
+                        st.session_state.t4_conds = [c for c in st.session_state.t4_conds if c in available_conds_4]
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.button("All", on_click=update_sel, args=("t4_conds", available_conds_4), key="btn_all_t4",
+                              use_container_width=True)
+                    c2.button("Insp Only", on_click=update_sel,
+                              args=("t4_conds", [c for c in available_conds_4 if "insp" in c.lower()]),
+                              key="btn_insp_t4", use_container_width=True)
+                    c3.button("Exp Only", on_click=update_sel, args=("t4_conds", [c for c in available_conds_4 if
+                                                                                  "exp" in c.lower() or "exs" in c.lower()]),
+                              key="btn_exp_t4", use_container_width=True)
+                    c4.button("Clear", on_click=update_sel, args=("t4_conds", []), key="btn_clr_t4",
+                              use_container_width=True)
+
+                    sel_conds_4 = st.multiselect(
+                        "Select Interventions to Compare side-by-side:",
+                        available_conds_4,
+                        key="t4_conds"
+                    )
+
+                    if sel_conds_4:
+                        cond_df_4 = stats_df[stats_df[cond_col].isin(sel_conds_4)].dropna(
+                            subset=[f'{stat_sensor} Pre {stat_metric}', f'{stat_sensor} Post {stat_metric}'])
+
+                        if not cond_df_4.empty:
+                            fig4 = go.Figure()
+                            added_legends = set()
+
+                            for cond in sel_conds_4:
+                                cdf = cond_df_4[cond_df_4[cond_col] == cond]
+                                if cdf.empty:
+                                    continue
+
+                                x_pre = f"{cond}<br>Pre"
+                                x_post = f"{cond}<br>Post"
+
+                                # 1. Add Box Plots for overall cohort statistics (Median, Q1, Q3, Min, Max)
+                                fig4.add_trace(go.Box(
+                                    y=cdf[f'{stat_sensor} Pre {stat_metric}'],
+                                    x=[x_pre] * len(cdf),
+                                    name=f'Cohort Pre ({cond})',
+                                    boxmean=True,  # Shows mean as a dashed line inside the box
+                                    fillcolor='rgba(139, 148, 158, 0.2)',
+                                    line=dict(color='#8b949e'),
+                                    showlegend=False,
+                                    hoverinfo='y'
+                                ))
+                                fig4.add_trace(go.Box(
+                                    y=cdf[f'{stat_sensor} Post {stat_metric}'],
+                                    x=[x_post] * len(cdf),
+                                    name=f'Cohort Post ({cond})',
+                                    boxmean=True,
+                                    fillcolor='rgba(139, 148, 158, 0.2)',
+                                    line=dict(color='#8b949e'),
+                                    showlegend=False,
+                                    hoverinfo='y'
+                                ))
+
+                                # 2. Add individual paired lines for every run, colored by Pig
+                                for idx, row in cdf.iterrows():
+                                    subj = row['Subject ID']
+                                    s_idx = available_subjects.index(subj) if subj in available_subjects else 0
+                                    p_color = MULTI_PALETTE[s_idx % len(MULTI_PALETTE)]
+
+                                    show_leg = subj not in added_legends
+                                    if show_leg:
+                                        added_legends.add(subj)
+
+                                    hover_text = (f"<b>{subj} - Run {row['Run ID']}</b><br>"
+                                                  f"Condition: {cond}<br>"
+                                                  f"Pre: {row[f'{stat_sensor} Pre {stat_metric}']}<br>"
+                                                  f"Post: {row[f'{stat_sensor} Post {stat_metric}']}<br>"
+                                                  f"Δ: {row[f'{stat_sensor} Δ']}")
+
+                                    fig4.add_trace(go.Scatter(
+                                        x=[x_pre, x_post],
+                                        y=[row[f'{stat_sensor} Pre {stat_metric}'],
+                                           row[f'{stat_sensor} Post {stat_metric}']],
+                                        mode='lines+markers',
+                                        line=dict(color=p_color, width=2),
+                                        marker=dict(size=8, symbol='circle', line=dict(width=1, color="#161b22")),
+                                        name=subj,
+                                        showlegend=show_leg,
+                                        hovertext=hover_text,
+                                        hoverinfo='text'
+                                    ))
+
+                            fig4.update_layout(
+                                title=dict(
+                                    text=f"<b>Cohort Before vs After (Multi-Intervention)</b><br><sup>Shows individual runs + overall cohort Box Plot (Median, IQR, Mean, Min/Max)</sup>",
+                                    font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
+                                yaxis_title=f"{stat_sensor} {stat_metric} (mmHg)",
+                                paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
+                                font=dict(family="IBM Plex Sans", color="#8b949e"),
+                                legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
+                                xaxis=dict(gridcolor="#21262d", linecolor="#30363d", showgrid=False),
+                                yaxis=dict(gridcolor="#21262d", linecolor="#30363d")
+                            )
+                            st.plotly_chart(fig4, use_container_width=True)
+                        else:
+                            st.info("No paired data available for the selected interventions.")
+                    else:
+                        st.info("Please select at least one intervention.")
+                else:
+                    st.info("No conditions available.")
+
+            # TAB 5: Cohort Deltas (Multi-Intervention)
+            with tab5:
+                available_conds_5 = sorted(stats_df[cond_col].astype(str).unique())
+                if available_conds_5:
+
+                    if "t5_conds" not in st.session_state:
+                        st.session_state.t5_conds = available_conds_5[:2] if len(
+                            available_conds_5) >= 2 else available_conds_5
+                    else:
+                        st.session_state.t5_conds = [c for c in st.session_state.t5_conds if c in available_conds_5]
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.button("All", on_click=update_sel, args=("t5_conds", available_conds_5), key="btn_all_t5",
+                              use_container_width=True)
+                    c2.button("Insp Only", on_click=update_sel,
+                              args=("t5_conds", [c for c in available_conds_5 if "insp" in c.lower()]),
+                              key="btn_insp_t5", use_container_width=True)
+                    c3.button("Exp Only", on_click=update_sel, args=("t5_conds", [c for c in available_conds_5 if
+                                                                                  "exp" in c.lower() or "exs" in c.lower()]),
+                              key="btn_exp_t5", use_container_width=True)
+                    c4.button("Clear", on_click=update_sel, args=("t5_conds", []), key="btn_clr_t5",
+                              use_container_width=True)
+
+                    sel_conds_5 = st.multiselect(
+                        "Select Interventions to Compare side-by-side:",
+                        available_conds_5,
+                        key="t5_conds"
+                    )
+
+                    if sel_conds_5:
+                        cond_df_5 = stats_df[stats_df[cond_col].isin(sel_conds_5)].dropna(subset=[f'{stat_sensor} Δ'])
+
+                        if not cond_df_5.empty:
+                            fig5 = go.Figure()
+                            added_legends = set()
+
+                            # 1. Add Box Plots for overall cohort delta statistics
+                            for cond in sel_conds_5:
+                                cdf = cond_df_5[cond_df_5[cond_col] == cond]
+                                if cdf.empty:
+                                    continue
+
+                                fig5.add_trace(go.Box(
+                                    y=cdf[f'{stat_sensor} Δ'],
+                                    x=[cond] * len(cdf),
+                                    name=f'Cohort Δ ({cond})',
+                                    boxmean=True,
+                                    fillcolor='rgba(139, 148, 158, 0.2)',
+                                    line=dict(color='#8b949e'),
+                                    showlegend=False,
+                                    hoverinfo='y'
+                                ))
+
+                            # 2. Add individual points for every run, colored by Pig
+                            for idx, row in cond_df_5.iterrows():
+                                cond = row[cond_col]
+                                subj = row['Subject ID']
+                                s_idx = available_subjects.index(subj) if subj in available_subjects else 0
+                                p_color = MULTI_PALETTE[s_idx % len(MULTI_PALETTE)]
+
+                                show_leg = subj not in added_legends
+                                if show_leg:
+                                    added_legends.add(subj)
+
+                                hover_text = (f"<b>{subj} - Run {row['Run ID']}</b><br>"
+                                              f"Condition: {cond}<br>"
+                                              f"Δ: {row[f'{stat_sensor} Δ']}<br>"
+                                              f"Pre: {row[f'{stat_sensor} Pre {stat_metric}']}<br>"
+                                              f"Post: {row[f'{stat_sensor} Post {stat_metric}']}")
+
+                                fig5.add_trace(go.Scatter(
+                                    x=[cond],
+                                    y=[row[f'{stat_sensor} Δ']],
+                                    mode='markers',
+                                    marker=dict(color=p_color, size=8, symbol='circle',
+                                                line=dict(width=1, color="#161b22")),
+                                    name=subj,
+                                    showlegend=show_leg,
+                                    hovertext=hover_text,
+                                    hoverinfo='text'
+                                ))
+
+                            fig5.add_hline(y=0, line_dash="dash", line_color="#8b949e", opacity=0.5)
+
+                            fig5.update_layout(
+                                title=dict(
+                                    text=f"<b>Cohort Deltas (Multi-Intervention)</b><br><sup>Shows individual runs + overall cohort Box Plot for Δ (Median, IQR, Mean, Min/Max)</sup>",
+                                    font=dict(size=14, color="#e6edf3", family="IBM Plex Sans")),
+                                yaxis_title=f"Δ {stat_sensor} ({stat_metric} mmHg)",
+                                paper_bgcolor="#161b22", plot_bgcolor="#0d1117",
+                                font=dict(family="IBM Plex Sans", color="#8b949e"),
+                                legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
+                                xaxis=dict(gridcolor="#21262d", linecolor="#30363d", showgrid=False),
+                                yaxis=dict(gridcolor="#21262d", linecolor="#30363d")
+                            )
+                            st.plotly_chart(fig5, use_container_width=True)
+                        else:
+                            st.info("No delta data available for the selected interventions.")
+                    else:
+                        st.info("Please select at least one intervention.")
+                else:
+                    st.info("No conditions available.")
 
             # --- Downloads for Stats ---
             csv_stats = stats_df.to_csv(index=False).encode('utf-8')
